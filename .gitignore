@@ -2,3 +2,23 @@
 __pycache__/
 *.pyc
 .claude/settings.local.json
+.venv/
+.vscode/
+
+# Model checkpoints (too big for GitHub; they go on Google Drive)
+part1/out/
+part1/out_augmented/
+part2/checkpoints/
+
+# Training logs
+part2/logs/
+
+# Per-experiment outputs: keep only the tracked files and the Gradescope submission files
+part2/results/*
+!part2/results/README.md
+!part2/results/t5_ft_experiment_test.sql
+!part2/results/t5_ft_experiment_ec_test.sql
+part2/records/*
+!part2/records/ground_truth_dev.pkl
+!part2/records/t5_ft_experiment_test.pkl
+!part2/records/t5_ft_experiment_ec_test.pkl

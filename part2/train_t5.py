@@ -6,14 +6,16 @@ import torch
 import torch.nn as nn
 import numpy as np
 import wandb
+import re
 
 from t5_utils import initialize_model, initialize_optimizer_and_scheduler, save_model, load_model_from_checkpoint, setup_wandb
-from transformers import GenerationConfig
-from load_data import load_t5_data
+from transformers import GenerationConfig, T5TokenizerFast
+from load_data import load_t5_data, BOS_ID
 from utils import compute_metrics, save_queries_and_records
 
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 PAD_IDX = 0
+tokenizer = T5TokenizerFast.from_pretrained("google-t5/t5-small")
 
 def get_args():
     '''
@@ -38,6 +40,8 @@ def get_args():
                         help="How many epochs to train the model for")
     parser.add_argument('--patience_epochs', type=int, default=0,
                         help="If validation performance stops improving, how many epochs should we wait before stopping?")
+    parser.add_argument('--early_stop_metric', type=str, default='record_f1', choices=['record_f1', 'dev_loss'],
+                        help="Dev metric used for early stopping and picking the best checkpoint")
 
     parser.add_argument('--use_wandb', action='store_true',
                         help="If set, we will use wandb to keep track of experiments")
@@ -48,11 +52,18 @@ def get_args():
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--test_batch_size', type=int, default=16)
 
+    # Generation hyperparameters
+    parser.add_argument('--num_beams', type=int, default=1,
+                        help="Beam size for generation (1 = greedy decoding)")
+    parser.add_argument('--word_dropout', type=float, default=0.0,
+                            help="Word dropout rate")
+
     args = parser.parse_args()
     return args
 
 def train(args, model, train_loader, dev_loader, optimizer, scheduler):
     best_f1 = -1
+    best_loss = float('inf')
     epochs_since_improvement = 0
 
     model_type = 'ft' if args.finetune else 'scr'
@@ -82,8 +93,14 @@ def train(args, model, train_loader, dev_loader, optimizer, scheduler):
             }
             wandb.log(result_dict, step=epoch)
 
-        if record_f1 > best_f1:
-            best_f1 = record_f1
+        if args.early_stop_metric == 'dev_loss':
+            improved = eval_loss < best_loss
+        else:
+            improved = record_f1 > best_f1
+        best_f1 = max(best_f1, record_f1)
+        best_loss = min(best_loss, eval_loss)
+
+        if improved:
             epochs_since_improvement = 0
         else:
             epochs_since_improvement += 1
@@ -107,7 +124,11 @@ def train_epoch(args, model, train_loader, optimizer, scheduler):
         encoder_mask = encoder_mask.to(DEVICE)
         decoder_input = decoder_input.to(DEVICE)
         decoder_targets = decoder_targets.to(DEVICE)
-
+        mask = torch.rand(decoder_input.shape, device=decoder_input.device)
+        mask = mask < args.word_dropout
+        mask = mask & (decoder_input != 0)
+        mask[:, 0] = False
+        decoder_input = torch.where(mask, 2, decoder_input)
         logits = model(
             input_ids=encoder_input,
             attention_mask=encoder_mask,
@@ -138,16 +159,73 @@ def eval_epoch(args, model, dev_loader, gt_sql_pth, model_sql_path, gt_record_pa
     should both provide good results. If you find that this component of evaluation takes too long with your compute,
     we found the cross-entropy loss (in the evaluation set) to be well (albeit imperfectly) correlated with F1 performance.
     '''
-    # TODO
     model.eval()
-    return 0, 0, 0, 0, 0
+    total_loss = 0
+    total_tokens = 0
+    criterion = nn.CrossEntropyLoss()
+    with torch.no_grad():
+        all_sql = []
+        for encoder_input, encoder_mask, decoder_input, decoder_targets, _ in tqdm(dev_loader):
+            encoder_input = encoder_input.to(DEVICE)
+            encoder_mask = encoder_mask.to(DEVICE)
+            decoder_input = decoder_input.to(DEVICE)
+            decoder_targets = decoder_targets.to(DEVICE)
+            non_pad = (decoder_targets != PAD_IDX)
+
+            logits = model(
+                input_ids=encoder_input,
+                attention_mask=encoder_mask,
+                decoder_input_ids=decoder_input,
+            )['logits']
+
+            loss = criterion(logits[non_pad], decoder_targets[non_pad])
+            tokens = non_pad.sum().item()
+            total_loss += loss.item() * tokens
+            total_tokens += tokens
+
+            generated = model.generate(input_ids=encoder_input,
+                                       attention_mask=encoder_mask,
+                                       decoder_start_token_id=BOS_ID,
+                                       max_new_tokens=512,
+                                       num_beams=args.num_beams)
+            decoded = tokenizer.batch_decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            for i in range(len(decoded)):
+                decoded[i] = decoded[i].replace("less_than", "<")
+                decoded[i] = re.sub(r"'[^']*'", lambda m: m.group(0).upper(), decoded[i])
+            
+            all_sql.extend(decoded)
+
+        save_queries_and_records(all_sql, model_sql_path, model_record_path)
+        avg_loss = total_loss / total_tokens
+        match_sql, match_record, f1, error_msgs = compute_metrics(gt_sql_pth, model_sql_path, gt_record_path, model_record_path)
+        error_rate = 1 - error_msgs.count("") / len(error_msgs)
+
+    return avg_loss, f1, match_record, match_sql, error_rate
         
 def test_inference(args, model, test_loader, model_sql_path, model_record_path):
     '''
     You must implement inference to compute your model's generated SQL queries and its associated 
     database records. Implementation should be very similar to eval_epoch.
     '''
-    pass
+    model.eval()
+    with torch.no_grad():
+        all_sql = []
+        for encoder_input, encoder_mask, _ in tqdm(test_loader):
+            encoder_input = encoder_input.to(DEVICE)
+            encoder_mask = encoder_mask.to(DEVICE)
+            generated = model.generate(input_ids=encoder_input,
+                                       attention_mask=encoder_mask,
+                                       decoder_start_token_id=BOS_ID,
+                                       max_new_tokens=512,
+                                       num_beams=args.num_beams)
+            decoded = tokenizer.batch_decode(generated, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            for i in range(len(decoded)):
+                decoded[i] = decoded[i].replace("less_than", "<")
+                decoded[i] = re.sub(r"'[^']*'", lambda m: m.group(0).upper(), decoded[i])
+            all_sql.extend(decoded)
+
+        save_queries_and_records(all_sql, model_sql_path, model_record_path)
+
 
 def main():
     # Get key arguments

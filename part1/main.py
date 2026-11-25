@@ -44,8 +44,20 @@ def do_train(args, model, train_dataloader, save_dir="./out"):
     # Remember that pytorch uses gradient accumumlation so you need to use zero_grad (https://pytorch.org/tutorials/recipes/recipes/zeroing_out_gradients.html)
     # You can use progress_bar.update(1) to see the progress during training
     # You can refer to the pytorch tutorial covered in class for reference
+    loss_fn = torch.nn.CrossEntropyLoss()
+    for _ in range(num_epochs):
+        for batch in tqdm(train_dataloader):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            labels = batch["labels"]
+            outputs = model(**batch)
+            logits = outputs.logits
+            optimizer.zero_grad()
+            loss = loss_fn(logits, labels)
+            loss.backward()
+            optimizer.step()
 
-    raise NotImplementedError
+            lr_scheduler.step()
+            progress_bar.update(1)
 
     ##### YOUR CODE ENDS HERE ######
 
@@ -92,9 +104,20 @@ def create_augmented_dataloader(args, dataset):
     # Here, 'dataset' is the original dataset. You should return a dataloader called 'train_dataloader' -- this
     # dataloader will be for the original training split augmented with 5k random transformed examples from the training set.
     # You may find it helpful to see how the dataloader was created at other place in this code.
+    original_dataset = dataset["train"]
+    original_tokenized_dataset = original_dataset.map(tokenize_function, batched=True, load_from_cache_file=False)
+    original_tokenized_dataset = original_tokenized_dataset.remove_columns(["text"])
+    original_tokenized_dataset = original_tokenized_dataset.rename_column("label", "labels")
 
-    raise NotImplementedError
+    transformed_dataset = dataset["train"].map(custom_transform, load_from_cache_file=False).shuffle(seed=42).select(range(5000))
+    transformed_tokenized_dataset = transformed_dataset.map(tokenize_function, batched=True, load_from_cache_file=False)
+    transformed_tokenized_dataset = transformed_tokenized_dataset.remove_columns(["text"])
+    transformed_tokenized_dataset = transformed_tokenized_dataset.rename_column("label", "labels")
 
+    transformed_train_dataset = datasets.concatenate_datasets([transformed_tokenized_dataset, original_tokenized_dataset])
+    transformed_train_dataset.set_format("torch")
+    train_dataloader = DataLoader(transformed_train_dataset, batch_size=args.batch_size, shuffle=True)
+    
     ##### YOUR CODE ENDS HERE ######
 
     return train_dataloader
